@@ -1,1 +1,326 @@
+"""
+Drift Game - jogo de drift em Python + Pygame
 
+Instalação:  pip install pygame
+Execução:    python drift.py
+
+Controles:
+  W / Seta cima ....... acelerar
+  S / Seta baixo ...... frear / ré
+  A D / Setas ......... virar
+  ESPAÇO .............. freio de mão (ajuda a iniciar o drift)
+  R ................... reiniciar
+  ESC ................. sair
+"""
+import math
+import random
+import sys
+
+import pygame
+from pygame.math import Vector2
+
+LARGURA, ALTURA = 1000, 700
+FPS = 60
+
+COR_CHAO = (58, 60, 66)
+COR_GRADE = (66, 68, 75)
+COR_MARCA = (22, 22, 24)
+
+ACELERACAO = 560      # força do motor
+FREIO = 700           # força de frenagem
+RE = 260              # força da ré
+GIRO = 3.2            # velocidade de rotação (rad/s)
+ARRASTO = 0.0009      # resistência do ar (limita a velocidade máxima)
+ATRITO = 60           # atrito de rolagem
+VIDA_MARCA = 6.0      # segundos que a marca do pneu fica no chão
+
+
+def misturar(a, b, t):
+    """Mistura duas cores: t=0 -> a, t=1 -> b."""
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+class Carro:
+    def __init__(self):
+        self.sprite = self._criar_sprite()
+        self.reiniciar()
+
+    def reiniciar(self):
+        self.pos = Vector2(0, 0)
+        self.vel = Vector2(0, 0)
+        self.ang = -math.pi / 2  # apontando para cima
+        self.derrapando = False
+
+    @staticmethod
+    def _criar_sprite():
+        s = pygame.Surface((60, 34), pygame.SRCALPHA)
+        for x in (8, 40):  # rodas
+            pygame.draw.rect(s, (20, 20, 20), (x, 0, 12, 5), border_radius=2)
+            pygame.draw.rect(s, (20, 20, 20), (x, 29, 12, 5), border_radius=2)
+        pygame.draw.rect(s, (220, 40, 50), (0, 3, 60, 28), border_radius=9)  # carroceria
+        pygame.draw.rect(s, (30, 35, 50), (30, 7, 14, 20), border_radius=3)  # para-brisa
+        pygame.draw.rect(s, (30, 35, 50), (8, 8, 9, 18), border_radius=3)    # vidro traseiro
+        pygame.draw.rect(s, (170, 25, 35), (18, 7, 12, 20))                  # teto
+        pygame.draw.rect(s, (255, 230, 120), (55, 6, 4, 6))                  # faróis
+        pygame.draw.rect(s, (255, 230, 120), (55, 22, 4, 6))
+        return s
+
+    def eixos(self):
+        """Retorna (vetor da frente, vetor da direita) do carro."""
+        frente = Vector2(math.cos(self.ang), math.sin(self.ang))
+        return frente, Vector2(-frente.y, frente.x)
+
+    def rodas_traseiras(self):
+        frente, lado = self.eixos()
+        base = self.pos - frente * 20
+        return base + lado * 13, base - lado * 13
+
+    def atualizar(self, dt, teclas):
+        acelera = teclas[pygame.K_UP] or teclas[pygame.K_w]
+        freia = teclas[pygame.K_DOWN] or teclas[pygame.K_s]
+        esquerda = teclas[pygame.K_LEFT] or teclas[pygame.K_a]
+        direita = teclas[pygame.K_RIGHT] or teclas[pygame.K_d]
+        freio_mao = teclas[pygame.K_SPACE]
+
+        frente, lado = self.eixos()
+        v_f = self.vel.dot(frente)
+
+        # motor e freio
+        if acelera:
+            self.vel += frente * ACELERACAO * dt
+        if freia:
+            self.vel -= frente * (FREIO if v_f > 30 else RE) * dt
+
+        # direção (só gira se estiver em movimento)
+        velocidade = self.vel.length()
+        sentido = 1 if v_f >= -10 else -1
+        giro = int(bool(direita)) - int(bool(esquerda))
+        self.ang += giro * GIRO * min(1.0, velocidade / 250) * sentido * dt
+
+        # aderência dos pneus: o coração do drift
+        frente, lado = self.eixos()
+        v_f = self.vel.dot(frente)
+        v_l = self.vel.dot(lado)
+        self.derrapando = velocidade > 150 and abs(v_l) > 120
+
+        if freio_mao:
+            aderencia = 0.9
+        elif abs(v_l) > 140:
+            aderencia = 2.2   # pneu escorregando
+        else:
+            aderencia = 7.0   # pneu agarrando
+
+        v_l_novo = v_l * math.exp(-aderencia * dt)
+        if freio_mao:
+            v_f *= math.exp(-0.6 * dt)
+        else:
+            # parte da velocidade lateral perdida vira velocidade para frente
+            perdido = abs(v_l) - abs(v_l_novo)
+            v_f += perdido * 0.5 * (1 if v_f >= 0 else -1)
+        self.vel = frente * v_f + lado * v_l_novo
+
+        # resistência do ar + atrito
+        velocidade = self.vel.length()
+        if velocidade > 0:
+            nova = max(0.0, velocidade - (ARRASTO * velocidade ** 2 + ATRITO) * dt)
+            if nova > 0:
+                self.vel.scale_to_length(nova)
+            else:
+                self.vel.update(0, 0)
+
+        self.pos += self.vel * dt
+
+    def desenhar(self, tela, cam):
+        img = pygame.transform.rotate(self.sprite, -math.degrees(self.ang))
+        rect = img.get_rect(center=tuple(self.pos - cam))
+        tela.blit(img, rect)
+
+
+class Cone:
+    def __init__(self, x, y):
+        self.pos = Vector2(x, y)
+        self.vel = Vector2()
+        self.recente = 0.0
+
+    def atualizar(self, dt):
+        self.pos += self.vel * dt
+        self.vel *= math.exp(-3 * dt)
+        self.recente = max(0.0, self.recente - dt)
+
+    def desenhar(self, tela, cam):
+        p = self.pos - cam
+        if -20 < p.x < LARGURA + 20 and -20 < p.y < ALTURA + 20:
+            c = (int(p.x), int(p.y))
+            pygame.draw.circle(tela, (240, 110, 20), c, 12)
+            pygame.draw.circle(tela, (255, 255, 255), c, 8)
+            pygame.draw.circle(tela, (240, 110, 20), c, 4)
+
+
+class Jogo:
+    def __init__(self):
+        pygame.init()
+        self.tela = pygame.display.set_mode((LARGURA, ALTURA))
+        pygame.display.set_caption("Drift Game")
+        self.relogio = pygame.time.Clock()
+        self.fonte = pygame.font.SysFont("arial", 22)
+        self.fonte_grande = pygame.font.SysFont("arial", 44, bold=True)
+        self.carro = Carro()
+        self.recorde = 0
+        self.reiniciar()
+
+    def reiniciar(self):
+        self.carro.reiniciar()
+        self.cam = Vector2(-LARGURA / 2, -ALTURA / 2)
+        self.cones = self.criar_cones()
+        self.marcas = []    # [posição, vida]
+        self.fumacas = []   # [posição, velocidade, vida]
+        self.pontos = 0
+        self.drift_pts = 0.0
+        self.drift_tempo = 0.0
+        self.espera_banco = 0.0
+        self.aviso = ""
+        self.aviso_cor = (120, 255, 140)
+        self.aviso_tempo = 0.0
+
+    @staticmethod
+    def criar_cones():
+        cones = []
+        centros = [(700, 0), (-700, 0), (0, 800), (0, -800), (1400, 700), (-1400, -700)]
+        for cx, cy in centros:
+            cones.append(Cone(cx, cy))  # cone central para dar voltas
+            for i in range(16):
+                a = i * 2 * math.pi / 16
+                cones.append(Cone(cx + math.cos(a) * 230, cy + math.sin(a) * 230))
+        return cones
+
+    def combo(self):
+        return min(1 + self.drift_tempo * 0.75, 8)
+
+    def atualizar(self, dt):
+        carro = self.carro
+        carro.atualizar(dt, pygame.key.get_pressed())
+
+        # pontuação do drift
+        if carro.derrapando:
+            self.drift_tempo += dt
+            v_l = abs(carro.vel.dot(carro.eixos()[1]))
+            self.drift_pts += (v_l / 100) * (carro.vel.length() / 100) * 10 * self.combo() * dt
+            self.espera_banco = 0.0
+            for roda in carro.rodas_traseiras():
+                self.marcas.append([roda, VIDA_MARCA])
+                self.fumacas.append([Vector2(roda),
+                                     Vector2(random.uniform(-25, 25), random.uniform(-25, 25)),
+                                     0.8])
+        elif self.drift_pts > 0:
+            self.espera_banco += dt
+            if self.espera_banco > 0.5:  # drift terminou: soma os pontos
+                ganho = int(self.drift_pts)
+                self.pontos += ganho
+                self.recorde = max(self.recorde, self.pontos)
+                self.aviso, self.aviso_cor, self.aviso_tempo = f"+{ganho}", (120, 255, 140), 1.5
+                self.drift_pts = 0.0
+                self.drift_tempo = 0.0
+
+        # colisão com cones
+        frente, _ = carro.eixos()
+        for c in self.cones:
+            c.atualizar(dt)
+            d = c.pos - carro.pos
+            dist = d.length()
+            if dist < 30:
+                n = d.normalize() if dist > 0 else frente
+                c.pos = carro.pos + n * 30
+                c.vel = n * max(250, carro.vel.length() * 1.1)
+                carro.vel *= 0.95
+                if c.recente == 0 and self.drift_pts > 0:
+                    self.drift_pts = 0.0
+                    self.drift_tempo = 0.0
+                    self.aviso, self.aviso_cor, self.aviso_tempo = "Combo perdido!", (255, 90, 90), 1.5
+                c.recente = 0.5
+
+        # marcas de pneu e fumaça
+        self.marcas = [[p, v - dt] for p, v in self.marcas if v - dt > 0][-1500:]
+        for f in self.fumacas:
+            f[0] += f[1] * dt
+            f[2] -= dt
+        self.fumacas = [f for f in self.fumacas if f[2] > 0][-300:]
+
+        self.aviso_tempo = max(0.0, self.aviso_tempo - dt)
+
+        # câmera suave que "olha" na direção do movimento
+        alvo = carro.pos + carro.vel * 0.25 - Vector2(LARGURA / 2, ALTURA / 2)
+        self.cam += (alvo - self.cam) * min(1.0, 5 * dt)
+
+    def desenhar(self):
+        tela, cam, carro = self.tela, self.cam, self.carro
+        tela.fill(COR_CHAO)
+
+        # grade do chão
+        passo = 120
+        x = -(cam.x % passo)
+        while x < LARGURA:
+            pygame.draw.line(tela, COR_GRADE, (x, 0), (x, ALTURA))
+            x += passo
+        y = -(cam.y % passo)
+        while y < ALTURA:
+            pygame.draw.line(tela, COR_GRADE, (0, y), (LARGURA, y))
+            y += passo
+
+        # marcas dos pneus
+        for pos, vida in self.marcas:
+            p = pos - cam
+            if 0 <= p.x < LARGURA and 0 <= p.y < ALTURA:
+                cor = misturar(COR_CHAO, COR_MARCA, vida / VIDA_MARCA)
+                pygame.draw.circle(tela, cor, (int(p.x), int(p.y)), 3)
+
+        # fumaça
+        for pos, _, vida in self.fumacas:
+            p = pos - cam
+            cor = misturar(COR_CHAO, (210, 210, 215), vida / 0.8)
+            pygame.draw.circle(tela, cor, (int(p.x), int(p.y)), int(4 + (0.8 - vida) * 14))
+
+        for c in self.cones:
+            c.desenhar(tela, cam)
+        carro.desenhar(tela, cam)
+
+        # HUD
+        kmh = int(carro.vel.length() * 0.2)
+        linhas = [f"Velocidade: {kmh} km/h", f"Pontos: {self.pontos}", f"Recorde: {self.recorde}"]
+        for i, texto in enumerate(linhas):
+            tela.blit(self.fonte.render(texto, True, (240, 240, 240)), (20, 15 + i * 28))
+
+        if self.drift_pts > 0:
+            txt = self.fonte_grande.render(
+                f"DRIFT {int(self.drift_pts)}  x{self.combo():.1f}", True, (255, 215, 0))
+            tela.blit(txt, txt.get_rect(center=(LARGURA // 2, 70)))
+        if self.aviso_tempo > 0:
+            txt = self.fonte_grande.render(self.aviso, True, self.aviso_cor)
+            tela.blit(txt, txt.get_rect(center=(LARGURA // 2, 130)))
+
+        ajuda = "WASD/Setas: dirigir  |  ESPAÇO: freio de mão  |  R: reiniciar  |  ESC: sair"
+        txt = self.fonte.render(ajuda, True, (200, 200, 205))
+        tela.blit(txt, txt.get_rect(center=(LARGURA // 2, ALTURA - 22)))
+
+    def executar(self):
+        while True:
+            dt = min(self.relogio.tick(FPS) / 1000, 0.05)
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    self.sair()
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE:
+                        self.sair()
+                    if ev.key == pygame.K_r:
+                        self.reiniciar()
+            self.atualizar(dt)
+            self.desenhar()
+            pygame.display.flip()
+
+    @staticmethod
+    def sair():
+        pygame.quit()
+        sys.exit()
+
+
+if __name__ == "__main__":
+    Jogo().executar()
